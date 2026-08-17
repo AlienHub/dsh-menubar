@@ -68,6 +68,9 @@ jobs:
           cp -R DSHMenuBar.app dist/
           ln -s /Applications dist/Applications
           hdiutil create -volname "DSH Menu Bar" -srcfolder dist -ov -format UDZO "dsh-menubar-${VERSION}.dmg"
+          # Sign the DMG itself so spctl primary-signature checks pass.
+          codesign --force --sign "$DSH_CODESIGN_IDENTITY" --timestamp "dsh-menubar-${VERSION}.dmg"
+          codesign --verify --strict --verbose=2 "dsh-menubar-${VERSION}.dmg"
 
       - name: Notarize and staple DMG
         shell: bash
