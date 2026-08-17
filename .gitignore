@@ -1,0 +1,7 @@
+.build/
+DSHMenuBar.app/
+Resources/node-runtime/
+Resources/*.svg.png
+Resources/deepseek-whale.svg
+.DS_Store
+*.log
