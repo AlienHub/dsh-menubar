@@ -33,6 +33,13 @@ PLIST
 IDENTITY="${DSH_CODESIGN_IDENTITY:-}"
 if [ -n "$IDENTITY" ]; then
   echo "Signing with identity: $IDENTITY"
+  # Sign nested Mach-O binaries first (the bundled node), otherwise --deep
+  # leaves their existing ad-hoc signature in place and notarization rejects it.
+  while IFS= read -r macho; do
+    codesign --force --sign "$IDENTITY" --options runtime --timestamp "$macho"
+  done < <(find "$APP" -type f -perm +111 2>/dev/null | while IFS= read -r f; do
+    file -b "$f" 2>/dev/null | grep -q "Mach-O" && echo "$f"
+  done)
   codesign --force --deep --sign "$IDENTITY" --options runtime --timestamp "$APP"
 else
   echo "No identity; signing ad hoc."
