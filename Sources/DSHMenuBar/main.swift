@@ -89,7 +89,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func configureCommand() {
         let alert = NSAlert()
         alert.messageText = "Harness 启动命令"
-        alert.informativeText = "默认使用 npx。也可以填写已经安装的 dsh web。"
+        alert.informativeText = "默认优先使用本机的 node/npx；不可用时使用内置运行时。也可以填写已经安装的 dsh web。"
         let field = NSTextField(string: manager.command)
         field.frame = NSRect(x: 0, y: 0, width: 420, height: 24)
         alert.accessoryView = field
@@ -155,6 +155,11 @@ private enum DSHState {
 }
 
 private final class DSHProcessManager {
+    private struct LaunchCommand {
+        let value: String
+        let usesBundledNode: Bool
+    }
+
     let url = URL(string: "http://deepseek.harness.localhost:3080")!
     private let defaults = UserDefaults.standard
     private var process: Process?
@@ -169,17 +174,54 @@ private final class DSHProcessManager {
     }
 
     var command: String {
-        get { defaults.string(forKey: "dsh.command") ?? defaultCommand }
+        get { configuredCommand?.value ?? defaultLaunchCommand.value }
         set { defaults.set(newValue, forKey: "dsh.command") }
     }
 
-    // Prefer the bundled Node runtime; fall back to the system npx if it is absent.
-    private var defaultCommand: String {
+    private var configuredCommand: LaunchCommand? {
+        guard let value = defaults.string(forKey: "dsh.command"), !value.isEmpty else { return nil }
+        return LaunchCommand(value: value, usesBundledNode: false)
+    }
+
+    private lazy var defaultLaunchCommand: LaunchCommand = makeDefaultLaunchCommand()
+
+    private func makeDefaultLaunchCommand() -> LaunchCommand {
+        if let npx = localNpxPath() {
+            Diag.log("using local npx: \(npx)")
+            return LaunchCommand(value: "\(shellQuote(npx)) -y @deepseek-ai/dsh web", usesBundledNode: false)
+        }
         if let node = Bundle.main.url(forResource: "node", withExtension: nil, subdirectory: "node-runtime/bin"),
            let npx = Bundle.main.url(forResource: "npx-cli", withExtension: "js", subdirectory: "node-runtime/lib/node_modules/npm/bin") {
-            return "\(node.path) \(npx.path) -y @deepseek-ai/dsh web"
+            Diag.log("local npx unavailable; using bundled Node runtime")
+            return LaunchCommand(value: "\(shellQuote(node.path)) \(shellQuote(npx.path)) -y @deepseek-ai/dsh web", usesBundledNode: true)
         }
-        return "npx -y @deepseek-ai/dsh web"
+        Diag.log("local npx and bundled Node runtime unavailable; using shell npx")
+        return LaunchCommand(value: "npx -y @deepseek-ai/dsh web", usesBundledNode: false)
+    }
+
+    // Finder-launched apps do not inherit Homebrew's PATH, so resolve in a login shell.
+    private func localNpxPath() -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-lc", "command -v node >/dev/null 2>&1 && npx_path=\"$(command -v npx)\" && \"$npx_path\" --version >/dev/null 2>&1 && print -r -- \"$npx_path\""]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return path.isEmpty ? nil : path
+        } catch {
+            Diag.log("local npx probe failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private func shellQuote(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\\\"'\\\"'"))'"
     }
 
     // Directory of the bundled node bin, so the child process finds node on PATH.
@@ -203,14 +245,15 @@ private final class DSHProcessManager {
         }
         state = .starting
         runTrustPatch()
+        let launch = configuredCommand ?? defaultLaunchCommand
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/zsh")
         p.currentDirectoryURL = URL(fileURLWithPath: NSHomeDirectory())
-        p.arguments = ["-lc", "exec \(command)"]
+        p.arguments = ["-lc", "exec \(launch.value)"]
         var env = ProcessInfo.processInfo.environment
         env["DSH_HOST"] = "127.0.0.1"
         env["DSH_PORT"] = "3080"
-        if let binDir = bundledNodeBinDir {
+        if launch.usesBundledNode, let binDir = bundledNodeBinDir {
             env["PATH"] = binDir + ":" + (env["PATH"] ?? "")
         }
         p.environment = env
@@ -234,7 +277,7 @@ private final class DSHProcessManager {
             state = .running
             startReadyPolling()
             Diag.log("started: pid=\(p.processIdentifier) url=\(url.absoluteString)")
-            Diag.log("command: \(command)")
+            Diag.log("command: \(launch.value)")
         } catch {
             state = .failed
             Diag.log("start failed: \(error.localizedDescription)")

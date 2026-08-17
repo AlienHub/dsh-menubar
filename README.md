@@ -7,7 +7,7 @@
 ## 功能
 
 - **一键启动 / 停止** Harness（单个按钮随状态切换）
-- **内置 Node.js 运行时** —— 用户无需预装 Node/npx，开箱即用
+- **优先本机 Node.js** —— 若登录 shell 中的 `node`/`npx` 可用则优先使用；否则自动回退内置运行时
 - **本地域名访问** —— 自动打开 http://deepseek.harness.localhost:3080
 - **自动打开浏览器** —— 服务就绪后自动打开
 - **端口复用** —— 已有实例时自动复用，不重复启动
@@ -16,7 +16,7 @@
 
 ## 构建
 
-要求 macOS 13+ 与 Xcode Command Line Tools。
+要求 macOS 13+ 与 Xcode Command Line Tools；发布版支持 macOS 26/27。
 
 ```bash
 scripts/bundle-node.sh    # 下载并内置 Node.js 运行时（可选，跳过则回退系统 npx）
