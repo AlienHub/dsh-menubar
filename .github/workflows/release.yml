@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.2.0)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -11,6 +17,13 @@ permissions:
 jobs:
   build:
     runs-on: macos-latest
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      APPLE_SIGNING_P12_BASE64: ${{ secrets.APPLE_SIGNING_P12_BASE64 }}
+      APPLE_SIGNING_P12_PASSWORD: ${{ secrets.APPLE_SIGNING_P12_PASSWORD }}
+      APPLE_NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_BASE64 }}
+      APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+      APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
     steps:
       - uses: actions/checkout@v4
 
@@ -23,21 +36,71 @@ jobs:
       - name: Bundle Node runtime
         run: scripts/bundle-node.sh
 
-      - name: Build app
+      - name: Import Apple signing certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          CERT_PATH="$RUNNER_TEMP/apple-signing.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/dsh-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+          printf '%s' "$APPLE_SIGNING_P12_BASE64" | /usr/bin/base64 -D > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$APPLE_SIGNING_P12_PASSWORD" -A
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | awk -F '"' '/Developer ID Application:/{print $2; exit}')"
+          if [ -z "$IDENTITY" ]; then
+            echo "No Developer ID Application identity found in imported archive." >&2
+            exit 1
+          fi
+          echo "DSH_CODESIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "DSH_RELEASE_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+      - name: Build app (Developer ID signed)
         run: scripts/build-app.sh
 
       - name: Create DMG
         run: |
-          VERSION="${GITHUB_REF#refs/tags/}"
+          VERSION="${RELEASE_TAG#v}"
           mkdir -p dist
           cp -R DSHMenuBar.app dist/
           ln -s /Applications dist/Applications
           hdiutil create -volname "DSH Menu Bar" -srcfolder dist -ov -format UDZO "dsh-menubar-${VERSION}.dmg"
 
+      - name: Notarize and staple DMG
+        shell: bash
+        env:
+          DSH_NOTARY_KEY_PATH: ${{ runner.temp }}/AuthKey_${{ secrets.APPLE_NOTARY_KEY_ID }}.p8
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          DMG="dsh-menubar-${VERSION}.dmg"
+          printf '%s' "$APPLE_NOTARY_KEY_BASE64" | /usr/bin/base64 -D > "$DSH_NOTARY_KEY_PATH"
+          chmod 600 "$DSH_NOTARY_KEY_PATH"
+          xcrun notarytool submit "$DMG" \
+            --key "$DSH_NOTARY_KEY_PATH" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" \
+            --wait
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+          spctl -a -vv -t open --context context:primary-signature "$DMG"
+
       - name: Upload Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           files: dsh-menubar-*.dmg
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Remove temporary keychain
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${DSH_RELEASE_KEYCHAIN:-}" ]; then
+            security delete-keychain "$DSH_RELEASE_KEYCHAIN" || true
+          fi

@@ -30,5 +30,13 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>LSUIElement</key><true/>
 </dict></plist>
 PLIST
-codesign --force --deep --sign - "$APP" >/dev/null
+IDENTITY="${DSH_CODESIGN_IDENTITY:-}"
+if [ -n "$IDENTITY" ]; then
+  echo "Signing with identity: $IDENTITY"
+  codesign --force --deep --sign "$IDENTITY" --options runtime --timestamp "$APP"
+else
+  echo "No identity; signing ad hoc."
+  codesign --force --deep --sign - "$APP" >/dev/null
+fi
+codesign --verify --deep --strict "$APP"
 printf 'Built %s\n' "$APP"
