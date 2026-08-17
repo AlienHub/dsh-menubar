@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Node runtime
+        uses: actions/cache@v4
+        with:
+          path: Resources/node-runtime
+          key: node-runtime-22.21.1
+
+      - name: Bundle Node runtime
+        run: scripts/bundle-node.sh
+
+      - name: Build app
+        run: scripts/build-app.sh
+
+      - name: Create DMG
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+          mkdir -p dist
+          cp -R DSHMenuBar.app dist/
+          ln -s /Applications dist/Applications
+          hdiutil create -volname "DSH Menu Bar" -srcfolder dist -ov -format UDZO "dsh-menubar-${VERSION}.dmg"
+
+      - name: Upload Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dsh-menubar-*.dmg
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
