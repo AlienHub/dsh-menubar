@@ -8,10 +8,12 @@
 
 - **一键启动 / 停止** Harness（单个按钮随状态切换）
 - **优先本机 Node.js** —— 若登录 shell 中的 `node`/`npx` 可用则优先使用；否则自动回退内置运行时
+- **网络代理** —— 可跟随 macOS 系统 HTTP 代理、直连或配置本地 HTTP(S) 代理；自动注入 DSH 标准代理变量
 - **本地域名访问** —— 自动打开 http://deepseek.harness.localhost:3080
 - **自动打开浏览器** —— 服务就绪后自动打开
 - **端口复用** —— 已有实例时自动复用，不重复启动
 - **登录时自动启动**（菜单勾选，基于 launchd）
+- **原生自动更新** —— 使用 Sparkle 检查 GitHub Releases，菜单中可手动检查更新
 - **进程树清理** —— 停止时递归终止 npx→node 整个进程树
 
 ## 构建
@@ -33,6 +35,8 @@ open DSHMenuBar.app       # 打开
 | ▶️ 启动 Harness / ⏹ 停止 Harness | 随状态切换的一键开关 |
 | 打开 Harness | 浏览器打开本地域名 |
 | 配置启动命令… | 自定义 DSH 启动命令 |
+| 网络代理… | 跟随系统代理、直连或配置本地 HTTP(S) 代理；重启 Harness 后生效 |
+| 检查更新… | 从 GitHub Releases 检查并安装已签名的新版 App |
 | 登录时自动启动 | 安装/卸载 launchd 登录项 |
 | 退出 | 停止服务并退出 |
 
@@ -64,6 +68,7 @@ DSH 的 /api 信任围栏（防 DNS rebinding）默认只信任 localhost / 127.
 │   ├── build-app.sh               # 构建 .app bundle
 │   ├── bundle-node.sh             # 下载/内置 Node 运行时
 │   ├── patch-trust.sh             # *.localhost 信任补丁
+│   ├── sign-sparkle-framework.sh  # 发布签名 Sparkle 更新框架
 │   └── render-icon.swift          # 从 logo 生成鲸鱼 PNG
 └── LICENSE / README.md
 ```

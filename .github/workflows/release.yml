@@ -24,6 +24,7 @@ jobs:
       APPLE_NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_BASE64 }}
       APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
       APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+      SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -59,7 +60,7 @@ jobs:
           echo "DSH_RELEASE_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
 
       - name: Build app (Developer ID signed)
-        run: scripts/build-app.sh
+        run: DSH_APP_VERSION="${RELEASE_TAG#v}" scripts/build-app.sh
 
       - name: Create DMG
         run: |
@@ -91,11 +92,29 @@ jobs:
           xcrun stapler validate "$DMG"
           spctl -a -vv -t open --context context:primary-signature "$DMG"
 
+      - name: Generate signed update feed
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SPARKLE_PRIVATE_KEY"
+          VERSION="${RELEASE_TAG#v}"
+          KEY_PATH="$RUNNER_TEMP/sparkle-private-key"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          mkdir updates
+          cp "dsh-menubar-${VERSION}.dmg" updates/
+          .build/artifacts/sparkle/Sparkle/bin/generate_appcast \
+            --ed-key-file "$KEY_PATH" \
+            --download-url-prefix "https://github.com/AlienHub/dsh-menubar/releases/download/${RELEASE_TAG}/" \
+            -o appcast.xml updates
+
       - name: Upload Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          files: dsh-menubar-*.dmg
+          files: |
+            dsh-menubar-*.dmg
+            appcast.xml
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

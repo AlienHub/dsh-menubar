@@ -1,6 +1,8 @@
 import AppKit
 import Foundation
 import Darwin
+import SystemConfiguration
+import Sparkle
 
 // Record why the process is going away, so a "flash-quit" can be diagnosed.
 private func installCrashHandlers() {
@@ -26,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var toggleItem: NSMenuItem?
     private var launchAtLoginItem: NSMenuItem!
     private var timer: Timer?
+    private lazy var updaterController = SPUStandardUpdaterController(startingUpdater: false, updaterDelegate: nil, userDriverDelegate: nil)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -54,12 +57,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         add(menu, "打开 Harness", #selector(openHarness), "o")
         menu.addItem(.separator())
         add(menu, "配置启动命令…", #selector(configureCommand), ",")
+        add(menu, "网络代理…", #selector(configureProxy), "")
+        add(menu, "检查更新…", #selector(checkForUpdates), "")
         launchAtLoginItem = NSMenuItem(title: "登录时自动启动", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
         launchAtLoginItem.target = self
         menu.addItem(launchAtLoginItem)
         menu.addItem(.separator())
         add(menu, "退出", #selector(quit), "q")
         statusItem.menu = menu
+        if Bundle.main.object(forInfoDictionaryKey: "SUPublicEDKey") as? String != nil { updaterController.startUpdater() }
         if manager.launchAtLogin { manager.start() }
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
@@ -100,7 +106,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refresh()
     }
     @objc private func toggleLaunchAtLogin() { manager.launchAtLogin.toggle(); refresh() }
+    @objc private func configureProxy() {
+        let alert = NSAlert()
+        alert.messageText = "Harness 网络代理"
+        alert.informativeText = "配置会在下次启动 Harness 时生效。跟随系统会读取 macOS 的 HTTP/HTTPS 代理；自定义代理仅接受 HTTP(S) URL。"
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 62))
+        let mode = NSPopUpButton(frame: NSRect(x: 0, y: 34, width: 180, height: 26), pullsDown: false)
+        mode.addItems(withTitles: ["跟随系统代理", "直连", "自定义 HTTP 代理"])
+        mode.selectItem(at: manager.proxyMode.menuIndex)
+        let field = NSTextField(string: manager.customProxyURL)
+        field.placeholderString = "http://127.0.0.1:7890"
+        field.frame = NSRect(x: 0, y: 0, width: 420, height: 24)
+        container.addSubview(mode)
+        container.addSubview(field)
+        alert.accessoryView = container
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn,
+              let selectedMode = ProxyMode(menuIndex: mode.indexOfSelectedItem) else { return }
+        let customURL = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if selectedMode == .custom, ProxySettings.normalizedHTTPProxyURL(customURL) == nil {
+            let error = NSAlert()
+            error.alertStyle = .warning
+            error.messageText = "代理地址无效"
+            error.informativeText = "请输入类似 http://127.0.0.1:7890 的 HTTP(S) 代理地址。"
+            error.runModal()
+            return
+        }
+        manager.proxyMode = selectedMode
+        manager.customProxyURL = customURL
+        Diag.log("proxy configuration saved: \(manager.proxySummary)")
+    }
     @objc private func quit() { manager.stop(); NSApp.terminate(nil) }
+    @objc private func checkForUpdates(_ sender: Any?) { updaterController.checkForUpdates(sender) }
 
     private func refresh() {
         manager.refreshStateFromPort()
@@ -154,6 +193,98 @@ private enum DSHState {
     }
 }
 
+private enum ProxyMode: String {
+    case system
+    case direct
+    case custom
+
+    init?(menuIndex: Int) {
+        switch menuIndex {
+        case 0: self = .system
+        case 1: self = .direct
+        case 2: self = .custom
+        default: return nil
+        }
+    }
+
+    var menuIndex: Int {
+        switch self {
+        case .system: return 0
+        case .direct: return 1
+        case .custom: return 2
+        }
+    }
+}
+
+private enum ProxySettings {
+    static let modeKey = "network.proxy.mode"
+    static let customURLKey = "network.proxy.customURL"
+    private static let proxyKeys = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]
+
+    static func normalizedHTTPProxyURL(_ value: String) -> String? {
+        let candidate = value.contains("://") ? value : "http://\(value)"
+        guard let components = URLComponents(string: candidate),
+              let scheme = components.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              let host = components.host, !host.isEmpty else { return nil }
+        return components.url?.absoluteString
+    }
+
+    static func applying(mode: ProxyMode, customURL: String, to environment: [String: String]) -> [String: String] {
+        var result = environment
+        for key in proxyKeys { result.removeValue(forKey: key) }
+        switch mode {
+        case .direct:
+            break
+        case .custom:
+            apply(proxy: normalizedHTTPProxyURL(customURL), to: &result)
+        case .system:
+            applySystemProxy(to: &result)
+        }
+        let loopback = "localhost,127.0.0.1,::1"
+        let existing = result["NO_PROXY"] ?? result["no_proxy"]
+        result["NO_PROXY"] = existing.map { "\($0),\(loopback)" } ?? loopback
+        result.removeValue(forKey: "no_proxy")
+        return result
+    }
+
+    static func summary(mode: ProxyMode, customURL: String) -> String {
+        switch mode {
+        case .direct: return "direct"
+        case .custom: return "custom \(normalizedHTTPProxyURL(customURL) ?? "invalid")"
+        case .system:
+            let proxies = systemProxyURLs()
+            guard proxies.http != nil || proxies.https != nil else { return "system (no HTTP proxy)" }
+            return "system HTTP=\(proxies.http ?? "off") HTTPS=\(proxies.https ?? "off")"
+        }
+    }
+
+    private static func applySystemProxy(to environment: inout [String: String]) {
+        let proxies = systemProxyURLs()
+        if let http = proxies.http { environment["HTTP_PROXY"] = http }
+        if let https = proxies.https { environment["HTTPS_PROXY"] = https }
+    }
+
+    private static func apply(proxy: String?, to environment: inout [String: String]) {
+        guard let proxy else { return }
+        environment["HTTP_PROXY"] = proxy
+        environment["HTTPS_PROXY"] = proxy
+    }
+
+    private static func systemProxyURLs() -> (http: String?, https: String?) {
+        guard let settings = SCDynamicStoreCopyProxies(nil) as? [String: Any] else { return (nil, nil) }
+        return (proxyURL(prefix: "HTTP", enabledKey: kSCPropNetProxiesHTTPEnable as String, settings: settings),
+                proxyURL(prefix: "HTTPS", enabledKey: kSCPropNetProxiesHTTPSEnable as String, settings: settings))
+    }
+
+    private static func proxyURL(prefix: String, enabledKey: String, settings: [String: Any]) -> String? {
+        guard (settings[enabledKey] as? NSNumber)?.boolValue == true,
+              let host = settings["\(prefix)Proxy"] as? String,
+              let port = settings["\(prefix)Port"] as? NSNumber else { return nil }
+        return normalizedHTTPProxyURL("http://\(host):\(port.intValue)")
+    }
+}
+
 private final class DSHProcessManager {
     private struct LaunchCommand {
         let value: String
@@ -177,6 +308,18 @@ private final class DSHProcessManager {
         get { configuredCommand?.value ?? defaultLaunchCommand.value }
         set { defaults.set(newValue, forKey: "dsh.command") }
     }
+
+    var proxyMode: ProxyMode {
+        get { ProxyMode(rawValue: defaults.string(forKey: ProxySettings.modeKey) ?? "system") ?? .system }
+        set { defaults.set(newValue.rawValue, forKey: ProxySettings.modeKey) }
+    }
+
+    var customProxyURL: String {
+        get { defaults.string(forKey: ProxySettings.customURLKey) ?? "" }
+        set { defaults.set(newValue, forKey: ProxySettings.customURLKey) }
+    }
+
+    var proxySummary: String { ProxySettings.summary(mode: proxyMode, customURL: customProxyURL) }
 
     private var configuredCommand: LaunchCommand? {
         guard let value = defaults.string(forKey: "dsh.command"), !value.isEmpty else { return nil }
@@ -250,7 +393,7 @@ private final class DSHProcessManager {
         p.executableURL = URL(fileURLWithPath: "/bin/zsh")
         p.currentDirectoryURL = URL(fileURLWithPath: NSHomeDirectory())
         p.arguments = ["-lc", "exec \(launch.value)"]
-        var env = ProcessInfo.processInfo.environment
+        var env = ProxySettings.applying(mode: proxyMode, customURL: customProxyURL, to: ProcessInfo.processInfo.environment)
         env["DSH_HOST"] = "127.0.0.1"
         env["DSH_PORT"] = "3080"
         if launch.usesBundledNode, let binDir = bundledNodeBinDir {
@@ -278,6 +421,7 @@ private final class DSHProcessManager {
             startReadyPolling()
             Diag.log("started: pid=\(p.processIdentifier) url=\(url.absoluteString)")
             Diag.log("command: \(launch.value)")
+            Diag.log("proxy: \(proxySummary)")
         } catch {
             state = .failed
             Diag.log("start failed: \(error.localizedDescription)")
