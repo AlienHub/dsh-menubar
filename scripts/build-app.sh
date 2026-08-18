@@ -11,6 +11,9 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 cp "$BIN" "$APP/Contents/MacOS/DSHMenuBar"
 ditto "$ROOT/.build/release/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle.framework"
+# SwiftPM links Sparkle with @rpath but does not add the app bundle's Frameworks
+# directory. Add it before signing so dyld can load the embedded framework.
+install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/MacOS/DSHMenuBar"
 cp "$ROOT/Resources/deepseek-whale.png" "$APP/Contents/Resources/deepseek-whale.png"
 cp "$ROOT/scripts/patch-trust.sh" "$APP/Contents/Resources/patch-trust.sh"
 if [ -d "$ROOT/Resources/node-runtime" ]; then
