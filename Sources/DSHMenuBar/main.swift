@@ -320,6 +320,7 @@ private final class DSHProcessManager {
     }
 
     let url = URL(string: "http://deepseek.harness.localhost:3080")!
+    private let trustedLocalAuthority = "deepseek.harness.localhost:3080"
     private let defaults = UserDefaults.standard
     private var process: Process?
     private(set) var state: DSHState = .stopped
@@ -391,7 +392,7 @@ private final class DSHProcessManager {
         // DSH protects /api with a Host trust fence. The app intentionally opens
         // this stable loopback hostname, so declare that exact authority through
         // DSH's supported CLI instead of patching its npx cache at runtime.
-        let webArguments = "web --trusted-host deepseek.harness.localhost:3080"
+        let webArguments = "web --trusted-host \(trustedLocalAuthority)"
         if let node = localNodePath(), let dsh = installedRuntimeEntryURL() {
             Diag.log("using local Node with managed DSH runtime: \(node)")
             return LaunchCommand(value: "\(shellQuote(node)) \(shellQuote(dsh.path)) \(webArguments)", usesBundledNode: false)
@@ -410,6 +411,19 @@ private final class DSHProcessManager {
     }
 
     private var defaultLaunchCommand: LaunchCommand { makeDefaultLaunchCommand() }
+
+    // A command saved by an earlier app version (or entered as a custom npx
+    // command) can otherwise bypass the app's fixed local hostname policy.
+    // DSH accepts repeated --trusted-host flags, so appending our own authority
+    // preserves an intentional custom trust list while keeping this GUI usable.
+    private func withTrustedLocalAuthority(_ launch: LaunchCommand) -> LaunchCommand {
+        guard !launch.value.contains("--trusted-host"),
+              launch.value.localizedCaseInsensitiveContains("dsh"),
+              launch.value.localizedCaseInsensitiveContains("web") else { return launch }
+        let value = "\(launch.value) --trusted-host \(trustedLocalAuthority)"
+        Diag.log("appended trusted local authority to DSH launch command")
+        return LaunchCommand(value: value, usesBundledNode: launch.usesBundledNode)
+    }
 
     // Finder-launched apps do not inherit Homebrew's PATH, so resolve in a login shell.
     private func localNodePath() -> String? {
@@ -633,6 +647,44 @@ private final class DSHProcessManager {
         "'\(value.replacingOccurrences(of: "'", with: "'\\\"'\\\"'"))'"
     }
 
+    private func commandOutput(_ executable: String, _ arguments: [String]) -> String? {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: executable)
+        task.arguments = arguments
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = Pipe()
+        do {
+            try task.run()
+            task.waitUntilExit()
+            guard task.terminationStatus == 0 else { return nil }
+            let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return output.isEmpty ? nil : output
+        } catch {
+            return nil
+        }
+    }
+
+    // A 404 from an intentionally unknown /api endpoint means the Host fence
+    // accepted the hostname. A 403 means a stale DSH has not been launched
+    // with the authority the app opens in the browser.
+    private func trustedHostProbeStatus() -> Int? {
+        let output = commandOutput("/usr/bin/curl", [
+            "--silent", "--max-time", "1", "--output", "/dev/null", "--write-out", "%{http_code}",
+            "-H", "Host: \(trustedLocalAuthority)",
+            "http://127.0.0.1:3080/api/__dsh_menubar_trust_probe"
+        ])
+        return output.flatMap(Int.init)
+    }
+
+    private func isLikelyDSHPortOwner() -> Bool {
+        guard let ownerOutput = commandOutput("/usr/sbin/lsof", ["-nP", "-tiTCP:3080", "-sTCP:LISTEN"]),
+              let pid = ownerOutput.split(whereSeparator: \.isWhitespace).first.map(String.init),
+              let command = commandOutput("/bin/ps", ["-p", pid, "-o", "command="])?.lowercased() else { return false }
+        return command.contains("deepseek-ai/dsh") || command.contains("dsh/lib/bin")
+    }
+
     // Directory of the bundled node bin, so the child process finds node on PATH.
     private var bundledNodeBinDir: String? {
         guard let node = Bundle.main.url(forResource: "node", withExtension: nil, subdirectory: "node-runtime/bin") else { return nil }
@@ -646,6 +698,18 @@ private final class DSHProcessManager {
     func start() {
         guard process?.isRunning != true else { return }
         if isPortServed() {
+            if trustedHostProbeStatus() == 403 {
+                if isLikelyDSHPortOwner() {
+                    Diag.log("replacing stale DSH on 3080: it rejects \(trustedLocalAuthority)")
+                    killPortOwner()
+                    state = .starting
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.start() }
+                    return
+                }
+                state = .failed
+                Diag.log("port 3080 is owned by a server that rejects \(trustedLocalAuthority); not terminating unknown process")
+                return
+            }
             // An instance is already answering on 3080: reuse it instead of starting a duplicate.
             state = .running
             Diag.log("port 3080 already served, reusing existing instance")
@@ -661,7 +725,7 @@ private final class DSHProcessManager {
             return
         }
         state = .starting
-        let launch = configuredCommand ?? defaultLaunchCommand
+        let launch = withTrustedLocalAuthority(configuredCommand ?? defaultLaunchCommand)
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/zsh")
         p.currentDirectoryURL = URL(fileURLWithPath: NSHomeDirectory())
