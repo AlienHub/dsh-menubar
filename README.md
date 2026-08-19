@@ -1,78 +1,71 @@
 # DSH Menu Bar
 
-原生 macOS 菜单栏应用，用于一键托管运行 DeepSeek Harness（DSH）Web 服务。
+[简体中文](README.zh-CN.md)
 
-🐋 菜单栏鲸鱼图标 · 一键启动/停止 · 内置 Node.js 运行时 · 自动打开本地域名 · 开机自启
+A native macOS menu bar app for starting and managing the DeepSeek Harness (DSH) web service.
 
-## 功能
+🐋 Menu bar whale · one-click start/stop · managed DSH Runtime · local hostname · launch at login
 
-- **一键启动 / 停止** Harness（单个按钮随状态切换）
-- **优先本机 Node.js** —— 若登录 shell 中的 `node`/`npx` 可用则优先使用；否则自动回退内置运行时
-- **网络代理** —— 可跟随 macOS 系统 HTTP 代理、直连或配置本地 HTTP(S) 代理；自动注入 DSH 标准代理变量
-- **本地域名访问** —— 自动打开 http://deepseek.harness.localhost:3080
-- **自动打开浏览器** —— 服务就绪后自动打开
-- **端口复用** —— 已有实例时自动复用，不重复启动
-- **登录时自动启动**（菜单勾选，基于 launchd）
-- **原生自动更新** —— 使用 Sparkle 检查 GitHub Releases，菜单中可手动检查更新
-- **进程树清理** —— 停止时递归终止 npx→node 整个进程树
+## Features
 
-## 构建
+- **One-click start / stop** — a single menu action follows the service state.
+- **Managed DSH Runtime** — on the first start, the app visibly downloads and installs DSH into Application Support. Later starts run that local copy directly, without waiting for npx to download it again.
+- **DSH Runtime updates** — the menu shows the installed version, checks npm for an update, and installs a new DSH version independently of app releases.
+- **Proxy settings** — use macOS system HTTP proxy, direct connections, or a custom local HTTP(S) proxy. Proxy environment variables are passed to both DSH and the runtime installer.
+- **Local hostname** — opens `http://deepseek.harness.localhost:3080`.
+- **Trusted API host** — starts DSH with `--trusted-host deepseek.harness.localhost:3080` to prevent `/api` host-trust 403 errors.
+- **Browser opening** — opens the local URL once the service is ready.
+- **Port reuse** — reuses a service already listening on port 3080.
+- **Launch at login** — install or remove a launchd login item from the menu.
+- **Native app updates** — Sparkle checks signed GitHub Releases; updates can be checked manually from the menu.
 
-要求 macOS 13+ 与 Xcode Command Line Tools；发布版支持 macOS 26/27。
+## Build
+
+Requires macOS 13+, Xcode Command Line Tools, and Node.js/npm for the managed DSH runtime. Releases support macOS 26 and 27.
 
 ```bash
-scripts/bundle-node.sh    # 下载并内置 Node.js 运行时（可选，跳过则回退系统 npx）
-scripts/build-app.sh      # 构建 App
-open DSHMenuBar.app       # 打开
+scripts/bundle-node.sh    # optional: bundle Node only as an npx compatibility fallback
+scripts/build-app.sh      # build the app bundle
+open DSHMenuBar.app       # open it
 ```
 
-构建产物 DSHMenuBar.app 为纯菜单栏应用（无 Dock 图标、无窗口），启动后看屏幕右上角菜单栏的鲸鱼图标。
+`DSHMenuBar.app` is a menu-bar-only application: it has no Dock icon or main window. Look for the whale in the right side of the menu bar.
 
-## 使用
+## Menu
 
-| 菜单项 | 说明 |
+| Item | Description |
 |---|---|
-| ▶️ 启动 Harness / ⏹ 停止 Harness | 随状态切换的一键开关 |
-| 打开 Harness | 浏览器打开本地域名 |
-| 配置启动命令… | 自定义 DSH 启动命令 |
-| 网络代理… | 跟随系统代理、直连或配置本地 HTTP(S) 代理；重启 Harness 后生效 |
-| 检查更新… | 从 GitHub Releases 检查并安装已签名的新版 App |
-| 登录时自动启动 | 安装/卸载 launchd 登录项 |
-| 退出 | 停止服务并退出 |
+| Start Harness / Stop Harness | One-click service control |
+| Open Harness | Opens the local hostname in a browser |
+| DSH Runtime | Shows its version, installation progress, and available updates |
+| Configure launch command… | Use a custom DSH launch command |
+| Network proxy… | Use system proxy, direct networking, or a custom HTTP(S) proxy |
+| Check for updates… | Check GitHub Releases for a signed app update |
+| Launch at login | Install/remove the launchd login item |
 
-日志：
-- ~/Library/Logs/DSHMenuBar.log —— DSH 服务日志
-- ~/Library/Logs/DSHMenuBar-diag.log —— App 诊断日志
-- ~/Library/Logs/DSHMenuBar-crash.log —— 崩溃记录
+## Runtime lifecycle
 
-## 工作原理
+On first launch, the app uses the local `npm` to download official `@deepseek-ai/dsh` into:
 
-### 内置 Node 运行时
-
-App 内打包官方 Node.js 二进制（Contents/Resources/node-runtime/），启动 DSH 时优先用内置 Node 执行 npx-cli.js，用户无需装 Node。若未打包则回退系统 npx。
-
-### *.localhost 域名
-
-DSH 的 /api 信任围栏（防 DNS rebinding）默认只信任 localhost / 127.x.x.x / [::1]，会拒绝 *.localhost 子域。App 启动时自动应用幂等补丁（scripts/patch-trust.sh），把 isLoopbackHostname 扩展为也接受 *.localhost。依据 RFC 6761，.localhost 永远只解析到本机，攻击者无法伪造，不引入新攻击面。DSH 升级后下次启动自动重打。
-
-## 目录结构
-
-```
-.
-├── Package.swift                  # SwiftPM 清单
-├── Sources/DSHMenuBar/main.swift  # 全部 App 逻辑
-├── Resources/
-│   ├── deepseek-whale.png         # 菜单栏鲸鱼图标
-│   └── deepseek-logo.svg          # 图标来源（DeepSeek 官方 logo）
-├── scripts/
-│   ├── build-app.sh               # 构建 .app bundle
-│   ├── bundle-node.sh             # 下载/内置 Node 运行时
-│   ├── patch-trust.sh             # *.localhost 信任补丁
-│   ├── sign-sparkle-framework.sh  # 发布签名 Sparkle 更新框架
-│   └── render-icon.swift          # 从 logo 生成鲸鱼 PNG
-└── LICENSE / README.md
+```text
+~/Library/Application Support/DSHMenuBar/runtime
 ```
 
-## 许可
+The menu explicitly shows that download/install state. Once installed, the app launches that local DSH copy with local `node`, so ordinary starts do not require network access or npx package downloads. Updates are downloaded to a staging directory and become active only after the download completes successfully.
 
-MIT。鲸鱼图标源自 DeepSeek 官方 logo（[DeepSeek-V2](https://github.com/deepseek-ai/DeepSeek-V2)），仅用于菜单栏图标展示。
+This path requires a working local Node.js/npm installation (for example, Homebrew Node). The app's bundled Node is retained only as a legacy npx compatibility fallback and is not used to execute DSH native dependencies.
+
+## Logs
+
+- `~/Library/Logs/DSHMenuBar.log` — DSH service output
+- `~/Library/Logs/DSHMenuBar-diag.log` — app diagnostics
+- `~/Library/Logs/DSHMenuBar-crash.log` — crash records
+- `~/Library/Logs/DSHMenuBar-runtime-install.log` — runtime download/install output
+
+## Local hostname
+
+DSH's DNS-rebinding protection rejects untrusted API hosts. The app declares its only local hostname with the official `--trusted-host deepseek.harness.localhost:3080` argument. Under RFC 6761, `.localhost` always resolves to the local machine.
+
+## License
+
+MIT. The whale icon is derived from the official DeepSeek logo ([DeepSeek-V2](https://github.com/deepseek-ai/DeepSeek-V2)) and is used only as the menu-bar icon.

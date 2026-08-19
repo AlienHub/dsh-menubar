@@ -25,6 +25,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let manager = DSHProcessManager()
     private var statusItem: NSStatusItem!
     private var statusMenuItem: NSMenuItem!
+    private var runtimeMenuItem: NSMenuItem!
+    private var runtimeUpdateItem: NSMenuItem!
     private var toggleItem: NSMenuItem?
     private var launchAtLoginItem: NSMenuItem!
     private var timer: Timer?
@@ -56,6 +58,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(t)
         add(menu, "打开 Harness", #selector(openHarness), "o")
         menu.addItem(.separator())
+        runtimeMenuItem = NSMenuItem(title: "DSH Runtime：正在检查本地版本…", action: nil, keyEquivalent: "")
+        runtimeMenuItem.isEnabled = false
+        menu.addItem(runtimeMenuItem)
+        runtimeUpdateItem = NSMenuItem(title: "检查 DSH Runtime 更新", action: #selector(checkRuntimeUpdate), keyEquivalent: "")
+        runtimeUpdateItem.target = self
+        menu.addItem(runtimeUpdateItem)
         add(menu, "配置启动命令…", #selector(configureCommand), ",")
         add(menu, "网络代理…", #selector(configureProxy), "")
         add(menu, "检查更新…", #selector(checkForUpdates), "")
@@ -66,6 +74,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         add(menu, "退出", #selector(quit), "q")
         statusItem.menu = menu
         if Bundle.main.object(forInfoDictionaryKey: "SUPublicEDKey") as? String != nil { updaterController.startUpdater() }
+        manager.inspectRuntime()
+        manager.checkRuntimeUpdate()
         if manager.launchAtLogin { manager.start() }
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
@@ -95,12 +105,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func configureCommand() {
         let alert = NSAlert()
         alert.messageText = "Harness 启动命令"
-        alert.informativeText = "默认优先使用本机的 node/npx；不可用时使用内置运行时。也可以填写已经安装的 dsh web。"
+        alert.informativeText = "默认会下载并管理 DSH Runtime，再由本机 Node 启动。也可以填写已经安装的 dsh web 命令。"
         let field = NSTextField(string: manager.command)
         field.frame = NSRect(x: 0, y: 0, width: 420, height: 24)
         alert.accessoryView = field
         alert.addButton(withTitle: "保存")
         alert.addButton(withTitle: "取消")
+        // Status-item apps have no document window to restore focus to. Make
+        // the field the modal's explicit first responder so standard ⌘A,
+        // Delete and ⌘V reach its field editor instead of the menu bar.
+        let window = alert.window
+        window.initialFirstResponder = field
+        window.makeFirstResponder(field)
+        field.selectText(nil)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         manager.command = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         refresh()
@@ -123,6 +140,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.accessoryView = container
         alert.addButton(withTitle: "保存")
         alert.addButton(withTitle: "取消")
+        let window = alert.window
+        window.initialFirstResponder = field
+        window.makeFirstResponder(field)
+        field.selectText(nil)
         guard alert.runModal() == .alertFirstButtonReturn,
               let selectedMode = ProxyMode(menuIndex: mode.indexOfSelectedItem) else { return }
         let customURL = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -140,16 +161,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc private func quit() { manager.stop(); NSApp.terminate(nil) }
     @objc private func checkForUpdates(_ sender: Any?) { updaterController.checkForUpdates(sender) }
+    @objc private func checkRuntimeUpdate() { manager.checkRuntimeUpdate() }
+    @objc private func updateRuntime() { manager.updateRuntime() }
 
     private func refresh() {
         manager.refreshStateFromPort()
         statusMenuItem.title = manager.state.label
+        runtimeMenuItem.title = manager.runtimeMenuLabel
+        runtimeUpdateItem.title = manager.runtimeUpdateActionTitle
+        runtimeUpdateItem.isEnabled = manager.canManageRuntime
+        runtimeUpdateItem.action = manager.runtimeHasUpdate ? #selector(updateRuntime) : #selector(checkRuntimeUpdate)
         if let toggleItem {
             switch manager.state {
             case .stopped, .failed:
                 toggleItem.title = "▶️ 启动 Harness"
                 toggleItem.isEnabled = true
-            case .starting:
+            case .installing, .starting:
                 toggleItem.title = "⏳ 启动中…"
                 toggleItem.isEnabled = false
             case .running:
@@ -182,10 +209,11 @@ private enum Diag {
 }
 
 private enum DSHState {
-    case stopped, starting, running, failed
+    case stopped, installing, starting, running, failed
     var label: String {
         switch self {
         case .stopped: return "Harness 未运行"
+        case .installing: return "正在下载并安装 DSH Runtime…"
         case .starting: return "Harness 启动中…"
         case .running: return "Harness 运行中"
         case .failed: return "Harness 启动失败"
@@ -295,11 +323,39 @@ private final class DSHProcessManager {
     private let defaults = UserDefaults.standard
     private var process: Process?
     private(set) var state: DSHState = .stopped
+    private var runtimeInstallProcess: Process?
+    private var runtimeCheckProcess: Process?
+    private var runtimeVersion: String?
+    private var availableRuntimeVersion: String?
+    private var runtimeError: String?
     var isRunning: Bool { process?.isRunning == true || state == .running }
+    var runtimeHasUpdate: Bool {
+        guard let current = runtimeVersion, let available = availableRuntimeVersion else { return false }
+        return current != available
+    }
+    var canManageRuntime: Bool { runtimeInstallProcess == nil && runtimeCheckProcess == nil }
+    var runtimeMenuLabel: String {
+        if runtimeInstallProcess != nil { return "DSH Runtime：正在下载并安装…" }
+        if runtimeCheckProcess != nil { return "DSH Runtime：正在检查更新…" }
+        if let error = runtimeError { return "DSH Runtime：\(error)" }
+        if let current = runtimeVersion {
+            if let available = availableRuntimeVersion, available != current {
+                return "DSH Runtime：\(current)（可更新至 \(available)）"
+            }
+            return "DSH Runtime：\(current)（已安装）"
+        }
+        return "DSH Runtime：尚未安装"
+    }
+    var runtimeUpdateActionTitle: String {
+        if runtimeInstallProcess != nil { return "正在下载 DSH Runtime…" }
+        if let available = availableRuntimeVersion, runtimeHasUpdate { return "更新 DSH Runtime 至 \(available)" }
+        return "检查 DSH Runtime 更新"
+    }
 
     // Sync state from the actual port when we are not managing a live process,
     // so an instance started by a previous run (or outside the app) is reflected.
     func refreshStateFromPort() {
+        guard runtimeInstallProcess == nil else { return }
         guard process?.isRunning != true else { return }
         state = isPortServed() ? .running : .stopped
     }
@@ -323,26 +379,58 @@ private final class DSHProcessManager {
 
     private var configuredCommand: LaunchCommand? {
         guard let value = defaults.string(forKey: "dsh.command"), !value.isEmpty else { return nil }
+        // Migrate the command written by earlier app versions. It was the old
+        // built-in npx launcher, not an intentional custom runtime choice.
+        if value.contains("@deepseek-ai/dsh web") && value.contains("npx") {
+            return nil
+        }
         return LaunchCommand(value: value, usesBundledNode: false)
     }
 
-    private lazy var defaultLaunchCommand: LaunchCommand = makeDefaultLaunchCommand()
-
     private func makeDefaultLaunchCommand() -> LaunchCommand {
+        // DSH protects /api with a Host trust fence. The app intentionally opens
+        // this stable loopback hostname, so declare that exact authority through
+        // DSH's supported CLI instead of patching its npx cache at runtime.
+        let webArguments = "web --trusted-host deepseek.harness.localhost:3080"
+        if let node = localNodePath(), let dsh = installedRuntimeEntryURL() {
+            Diag.log("using local Node with managed DSH runtime: \(node)")
+            return LaunchCommand(value: "\(shellQuote(node)) \(shellQuote(dsh.path)) \(webArguments)", usesBundledNode: false)
+        }
         if let npx = localNpxPath() {
-            Diag.log("using local npx: \(npx)")
-            return LaunchCommand(value: "\(shellQuote(npx)) -y @deepseek-ai/dsh web", usesBundledNode: false)
+            Diag.log("bundled DSH unavailable; using local npx: \(npx)")
+            return LaunchCommand(value: "\(shellQuote(npx)) --prefer-offline -y @deepseek-ai/dsh \(webArguments)", usesBundledNode: false)
         }
         if let node = Bundle.main.url(forResource: "node", withExtension: nil, subdirectory: "node-runtime/bin"),
            let npx = Bundle.main.url(forResource: "npx-cli", withExtension: "js", subdirectory: "node-runtime/lib/node_modules/npm/bin") {
             Diag.log("local npx unavailable; using bundled Node runtime")
-            return LaunchCommand(value: "\(shellQuote(node.path)) \(shellQuote(npx.path)) -y @deepseek-ai/dsh web", usesBundledNode: true)
+            return LaunchCommand(value: "\(shellQuote(node.path)) \(shellQuote(npx.path)) --prefer-offline -y @deepseek-ai/dsh \(webArguments)", usesBundledNode: true)
         }
         Diag.log("local npx and bundled Node runtime unavailable; using shell npx")
-        return LaunchCommand(value: "npx -y @deepseek-ai/dsh web", usesBundledNode: false)
+        return LaunchCommand(value: "npx --prefer-offline -y @deepseek-ai/dsh \(webArguments)", usesBundledNode: false)
     }
 
+    private var defaultLaunchCommand: LaunchCommand { makeDefaultLaunchCommand() }
+
     // Finder-launched apps do not inherit Homebrew's PATH, so resolve in a login shell.
+    private func localNodePath() -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-lc", "node_path=\"$(command -v node)\" && \"$node_path\" --version >/dev/null 2>&1 && print -r -- \"$node_path\""]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+            let path = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return path.isEmpty ? nil : path
+        } catch {
+            Diag.log("local Node probe failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
     private func localNpxPath() -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
@@ -360,6 +448,184 @@ private final class DSHProcessManager {
         } catch {
             Diag.log("local npx probe failed: \(error.localizedDescription)")
             return nil
+        }
+    }
+
+    private func localNpmPath() -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-lc", "npm_path=\"$(command -v npm)\" && \"$npm_path\" --version >/dev/null 2>&1 && print -r -- \"$npm_path\""]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+            let path = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return path.isEmpty ? nil : path
+        } catch {
+            Diag.log("local npm probe failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private var runtimeRootURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/DSHMenuBar/runtime", isDirectory: true)
+    }
+
+    private var currentRuntimeURL: URL { runtimeRootURL.appendingPathComponent("current", isDirectory: true) }
+
+    private func installedRuntimeEntryURL() -> URL? {
+        let entry = currentRuntimeURL.appendingPathComponent("node_modules/@deepseek-ai/dsh/lib/bin.js")
+        return FileManager.default.fileExists(atPath: entry.path) ? entry : nil
+    }
+
+    func inspectRuntime() {
+        guard let entry = installedRuntimeEntryURL() else {
+            runtimeVersion = nil
+            return
+        }
+        let manifest = entry.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("package.json")
+        guard let data = try? Data(contentsOf: manifest),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let version = object["version"] as? String else {
+            runtimeVersion = "已安装"
+            return
+        }
+        runtimeVersion = version
+        runtimeError = nil
+    }
+
+    func checkRuntimeUpdate() {
+        guard runtimeInstallProcess == nil, runtimeCheckProcess == nil else { return }
+        guard let npm = localNpmPath() else {
+            runtimeError = "需要本机 Node.js/npm"
+            return
+        }
+        runtimeError = nil
+        let pipe = Pipe()
+        let check = Process()
+        check.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        check.arguments = ["-lc", "exec \(shellQuote(npm)) view @deepseek-ai/dsh version"]
+        check.standardOutput = pipe
+        check.standardError = Pipe()
+        check.environment = ProxySettings.applying(mode: proxyMode, customURL: customProxyURL, to: ProcessInfo.processInfo.environment)
+        check.terminationHandler = { [weak self] process in
+            let version = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.runtimeCheckProcess = nil
+                if process.terminationStatus == 0, let version, !version.isEmpty {
+                    self.availableRuntimeVersion = version
+                    self.runtimeError = nil
+                } else {
+                    self.runtimeError = "无法检查更新"
+                    Diag.log("DSH runtime update check failed: status=\(process.terminationStatus)")
+                }
+            }
+        }
+        do {
+            try check.run()
+            runtimeCheckProcess = check
+        } catch {
+            runtimeError = "无法检查更新"
+            Diag.log("DSH runtime update check launch failed: \(error.localizedDescription)")
+        }
+    }
+
+    func updateRuntime() {
+        guard localNodePath() != nil, localNpmPath() != nil else {
+            runtimeError = "需要本机 Node.js/npm"
+            return
+        }
+        let restartAfterInstall = isRunning
+        if restartAfterInstall { stop() }
+        installRuntime { [weak self] success in
+            if success, restartAfterInstall { self?.start() }
+        }
+    }
+
+    private func installRuntime(completion: @escaping (Bool) -> Void) {
+        guard runtimeInstallProcess == nil else { return }
+        guard localNodePath() != nil, let npm = localNpmPath() else {
+            runtimeError = "需要本机 Node.js/npm"
+            state = .failed
+            completion(false)
+            return
+        }
+        let fileManager = FileManager.default
+        let staging = runtimeRootURL.appendingPathComponent(".staging-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try fileManager.createDirectory(at: runtimeRootURL, withIntermediateDirectories: true)
+        } catch {
+            runtimeError = "无法创建运行时目录"
+            state = .failed
+            completion(false)
+            return
+        }
+        state = .installing
+        runtimeError = nil
+        let install = Process()
+        install.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        install.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
+        install.arguments = ["-lc", "exec \(shellQuote(npm)) install --prefix \(shellQuote(staging.path)) --omit=dev --no-audit --no-fund @deepseek-ai/dsh"]
+        install.environment = ProxySettings.applying(mode: proxyMode, customURL: customProxyURL, to: ProcessInfo.processInfo.environment)
+        let logURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/DSHMenuBar-runtime-install.log")
+        try? fileManager.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        fileManager.createFile(atPath: logURL.path, contents: nil)
+        if let handle = try? FileHandle(forWritingTo: logURL) {
+            install.standardOutput = handle
+            install.standardError = handle
+        }
+        install.terminationHandler = { [weak self] process in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.runtimeInstallProcess = nil
+                let entry = staging.appendingPathComponent("node_modules/@deepseek-ai/dsh/lib/bin.js")
+                guard process.terminationStatus == 0, fileManager.fileExists(atPath: entry.path) else {
+                    try? fileManager.removeItem(at: staging)
+                    self.runtimeError = "下载或安装失败（查看运行时日志）"
+                    self.state = .failed
+                    Diag.log("DSH runtime install failed: status=\(process.terminationStatus)")
+                    completion(false)
+                    return
+                }
+                let previous = self.runtimeRootURL.appendingPathComponent("previous", isDirectory: true)
+                do {
+                    try? fileManager.removeItem(at: previous)
+                    if fileManager.fileExists(atPath: self.currentRuntimeURL.path) {
+                        try fileManager.moveItem(at: self.currentRuntimeURL, to: previous)
+                    }
+                    try fileManager.moveItem(at: staging, to: self.currentRuntimeURL)
+                    try? fileManager.removeItem(at: previous)
+                    self.inspectRuntime()
+                    self.availableRuntimeVersion = self.runtimeVersion
+                    self.state = .stopped
+                    Diag.log("DSH runtime installed: \(self.runtimeVersion ?? "unknown")")
+                    completion(true)
+                } catch {
+                    if !fileManager.fileExists(atPath: self.currentRuntimeURL.path), fileManager.fileExists(atPath: previous.path) {
+                        try? fileManager.moveItem(at: previous, to: self.currentRuntimeURL)
+                    }
+                    try? fileManager.removeItem(at: staging)
+                    self.runtimeError = "无法启用已下载的版本"
+                    self.state = .failed
+                    Diag.log("DSH runtime promotion failed: \(error.localizedDescription)")
+                    completion(false)
+                }
+            }
+        }
+        do {
+            try install.run()
+            runtimeInstallProcess = install
+            Diag.log("DSH runtime install started")
+        } catch {
+            runtimeError = "无法启动下载"
+            state = .failed
+            Diag.log("DSH runtime installer launch failed: \(error.localizedDescription)")
+            completion(false)
         }
     }
 
@@ -386,8 +652,15 @@ private final class DSHProcessManager {
             startReadyPolling()
             return
         }
+        // The managed runtime is downloaded once into Application Support. Do
+        // this before launching so normal starts never wait for npx to fetch.
+        if configuredCommand == nil, installedRuntimeEntryURL() == nil {
+            installRuntime { [weak self] success in
+                if success { self?.start() }
+            }
+            return
+        }
         state = .starting
-        runTrustPatch()
         let launch = configuredCommand ?? defaultLaunchCommand
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/zsh")
@@ -487,24 +760,6 @@ private final class DSHProcessManager {
             .compactMap { Int32($0) } ?? []
     }
 
-    // Idempotent: extend DSH trust fence so *.localhost Host is accepted (RFC 6761).
-    private func runTrustPatch() {
-        guard let url = Bundle.main.url(forResource: "patch-trust", withExtension: "sh") else {
-            Diag.log("trust patch: script missing in bundle")
-            return
-        }
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/bash")
-        p.arguments = [url.path]
-        do {
-            try p.run()
-            p.waitUntilExit()
-            Diag.log("trust patch exit: \(p.terminationStatus)")
-        } catch {
-            Diag.log("trust patch failed: \(error.localizedDescription)")
-        }
-    }
-
     // Poll until the harness responds, then open the local URL in the browser.
     private var readyTimer: Timer?
     private var readyAttempts = 0
@@ -584,7 +839,8 @@ struct Main {
         FileManager.default.changeCurrentDirectoryPath(NSHomeDirectory())
         // Single-instance guard: if another copy is already running, activate it and exit quietly.
         let me = getpid()
-        let others = NSRunningApplication.runningApplications(withBundleIdentifier: "ai.deepseek.harness.menubar")
+        let bundleIdentifier = Bundle.main.bundleIdentifier ?? "ai.deepseek.harness.menubar"
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
             .filter { $0.processIdentifier != me }
         if !others.isEmpty {
             others.first?.activate()

@@ -5,8 +5,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$ROOT/DSHMenuBar.app"
 BIN="$ROOT/.build/release/DSHMenuBar"
 VERSION="${DSH_APP_VERSION:-0.2.4}"
+BUNDLE_ID="${DSH_BUNDLE_IDENTIFIER:-ai.deepseek.harness.menubar}"
 
-swift build -c release --package-path "$ROOT"
+swift build -c release --disable-sandbox --package-path "$ROOT"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 cp "$BIN" "$APP/Contents/MacOS/DSHMenuBar"
@@ -15,7 +16,7 @@ ditto "$ROOT/.build/release/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle
 # directory. Add it before signing so dyld can load the embedded framework.
 install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/MacOS/DSHMenuBar"
 cp "$ROOT/Resources/deepseek-whale.png" "$APP/Contents/Resources/deepseek-whale.png"
-cp "$ROOT/scripts/patch-trust.sh" "$APP/Contents/Resources/patch-trust.sh"
+actool --compile "$APP/Contents/Resources" --output-partial-info-plist "$APP/Contents/Resources/asset-info.plist" --platform macosx --minimum-deployment-target 13.0 --app-icon AppIcon "$ROOT/Resources/Assets.xcassets"
 if [ -d "$ROOT/Resources/node-runtime" ]; then
   echo "bundling node runtime ..."
   cp -R "$ROOT/Resources/node-runtime" "$APP/Contents/Resources/node-runtime"
@@ -26,8 +27,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <plist version="1.0"><dict>
 <key>CFBundleDisplayName</key><string>DSH Menu Bar</string>
 <key>CFBundleExecutable</key><string>DSHMenuBar</string>
-<key>CFBundleIdentifier</key><string>ai.deepseek.harness.menubar</string>
+<key>CFBundleIdentifier</key><string>BUNDLE_ID_PLACEHOLDER</string>
 <key>CFBundleName</key><string>DSH Menu Bar</string>
+<key>CFBundleIconName</key><string>AppIcon</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>VERSION_PLACEHOLDER</string>
 <key>CFBundleVersion</key><string>VERSION_PLACEHOLDER</string>
@@ -43,6 +46,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict></plist>
 PLIST
 /usr/bin/sed -i '' "s/VERSION_PLACEHOLDER/$VERSION/g" "$APP/Contents/Info.plist"
+/usr/bin/sed -i '' "s/BUNDLE_ID_PLACEHOLDER/$BUNDLE_ID/g" "$APP/Contents/Info.plist"
 IDENTITY="${DSH_CODESIGN_IDENTITY:-}"
 if [ -n "$IDENTITY" ]; then
   echo "Signing with identity: $IDENTITY"
